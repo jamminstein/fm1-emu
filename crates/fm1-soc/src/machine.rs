@@ -622,6 +622,8 @@ pub fn run_cpu1(c1: &mut Cpu, soc: &mut Soc, cycles: u64, until: Option<Wait>) -
         soc.cpu1_idle = false;
     }
     let probe = (c1.pc, c1.regs, c1.sp);
+    c1.probe[..16].copy_from_slice(&c1.regs);
+    c1.probe[16] = c1.sp;
     let budget = cycles.min(1 << 20);
     let mut left = budget;
     // first a block at a time, looking for the way back to where it started (a polling loop
