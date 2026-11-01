@@ -21,6 +21,15 @@
 //! write, an idle skip) the code leaves right after the instruction. Within a region every block
 //! first checks that its instructions still fit the call's limit (as jit.rs's chained bodies
 //! do); edges out of the region, computed jumps and returns go back to `run_fast`.
+//!
+//! The guest registers live in wasm locals for the whole of a call (`L_REG`): `run` loads the
+//! ones the region touches from `Cpu::regs` on entry, every op reads and writes the locals, and
+//! the ones the region writes go back to memory at the single exit (`exit`) and before each
+//! `h_op` call, whose executor runs the op on `Cpu::regs` (all touched ones are loaded again
+//! after it). `h_read` and `h_write` reach only the bus. sp, rets, pc and the rest stay in
+//! memory. (As jit.rs's `RegCache`, over a whole region: each operand was a load through the cpu
+//! pointer and each result a store, and the regions' code was 40-48% of the time of every
+//! firmware, memory-bound in both of V8's tiers.)
 
 use crate::{Base, Bus, Cond, Cpu, Fast, JitMem, Op, RmwOp};
 use std::mem::offset_of;
@@ -305,7 +314,6 @@ const ELSE: u8 = 0x05;
 const END: u8 = 0x0b;
 const BR: u8 = 0x0c;
 const BR_TABLE: u8 = 0x0e;
-const RETURN: u8 = 0x0f;
 const CALL: u8 = 0x10;
 const LOCAL_GET: u8 = 0x20;
 const LOCAL_SET: u8 = 0x21;
@@ -388,7 +396,8 @@ const F_OP: u32 = 2;
 const F_RUN: u32 = 3;
 
 // locals: params cpu, ctx, limit, start; then i32 temporaries, the instructions done in this call
-// before the current block, the block to run next, one i64, and two f32 (the FPU's fmin / fmax)
+// before the current block, the block to run next, one i64, two f32 (the FPU's fmin / fmax),
+// the pc to leave at, and the 16 guest registers
 const L_CPU: u32 = 0;
 const L_CTX: u32 = 1;
 const L_LIMIT: u32 = 2;
@@ -403,6 +412,12 @@ const L_CUR: u32 = 10;
 const L_OPRES: u32 = 11;
 const L_FA: u32 = 12;
 const L_FB: u32 = 13;
+const L_PC: u32 = 14;
+const L_REG: u32 = 15;
+/// the local holding guest register r
+fn l_reg(r: u8) -> u32 {
+    L_REG + (r & 15) as u32
+}
 
 fn off_reg(r: u8) -> u32 {
     (offset_of!(Cpu, regs) + 4 * (r & 15) as usize) as u32
@@ -447,6 +462,16 @@ struct Gen<'a> {
     nest: u32,
     /// the stretch's stop checks at each block's entry (`Jit::stops`)
     stops: bool,
+    /// the guest registers the region reads or writes, and those it writes (bit r), as the
+    /// code emitted so far has them (`ld_reg` / `st_reg` record them); `load` and `store` are
+    /// the same from the first pass of `compile`, so the entry's loads, the exit's stores and
+    /// the flush and reload around `h_op` can cover the whole region
+    used: u16,
+    written: u16,
+    load: u16,
+    store: u16,
+    /// the first pass: nothing is leaked for the helpers
+    dry: bool,
 }
 
 impl Gen<'_> {
@@ -474,16 +499,41 @@ impl Gen<'_> {
         uleb(&mut self.c, align as u64);
         uleb(&mut self.c, off as u64);
     }
-    /// push the guest register r
+    /// push the guest register r (its local)
     fn ld_reg(&mut self, r: u8) {
-        self.get(L_CPU);
-        self.mem_op(I32_LOAD, 2, off_reg(r));
+        self.used |= 1 << (r & 15);
+        self.get(l_reg(r));
+    }
+    /// guest register d = the top of the stack
+    fn st_reg(&mut self, d: u8) {
+        self.used |= 1 << (d & 15);
+        self.written |= 1 << (d & 15);
+        self.set(l_reg(d));
     }
     /// guest register d = local l
     fn st_reg_from(&mut self, d: u8, l: u32) {
-        self.get(L_CPU);
         self.get(l);
-        self.mem_op(I32_STORE, 2, off_reg(d));
+        self.st_reg(d);
+    }
+    /// the guest registers in `mask` from `Cpu::regs` into their locals
+    fn load_regs(&mut self, mask: u16) {
+        for r in 0..16u8 {
+            if mask & (1 << r) != 0 {
+                self.get(L_CPU);
+                self.mem_op(I32_LOAD, 2, off_reg(r));
+                self.set(l_reg(r));
+            }
+        }
+    }
+    /// the guest registers in `mask` from their locals into `Cpu::regs`
+    fn store_regs(&mut self, mask: u16) {
+        for r in 0..16u8 {
+            if mask & (1 << r) != 0 {
+                self.get(L_CPU);
+                self.get(l_reg(r));
+                self.mem_op(I32_STORE, 2, off_reg(r));
+            }
+        }
     }
     fn ld_field(&mut self, off: u32) {
         self.get(L_CPU);
@@ -504,17 +554,24 @@ impl Gen<'_> {
     }
     /// leave with pc = imm, `count` instructions of this block done
     fn exit_imm(&mut self, pc: u32, count: u32) {
-        self.get(L_CPU);
         self.i32c(pc);
-        self.mem_op(I32_STORE, 2, off_pc());
-        self.done_plus(count);
-        self.op(RETURN);
+        self.set(L_PC);
+        self.exit(count);
     }
     /// leave with pc = local l
     fn exit_local(&mut self, l: u32, count: u32) {
-        self.st_field_from(off_pc(), l);
+        self.get(l);
+        self.set(L_PC);
+        self.exit(count);
+    }
+    /// leave: to the function's one exit (`compile`), which stores the pc from L_PC, writes
+    /// the guest registers back and returns the count in L_DONE; it lies past the dispatch
+    /// loop and the blocks still open after this one's code, and the ifs
+    fn exit(&mut self, count: u32) {
         self.done_plus(count);
-        self.op(RETURN);
+        self.set(L_DONE);
+        self.op(BR);
+        uleb(&mut self.c, (self.n - self.cur + self.nest) as u64);
     }
     /// continue at the pc in local l (a return, a pc popped, a table branch, a helper's jump):
     /// the region's block there, found in its table, else back to Rust. (Every such jump used
@@ -846,23 +903,44 @@ fn helpers<B: Bus>(profile: bool) -> [u32; 3] {
 }
 
 fn compile<B: Bus>(blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem, stops: bool) -> Vec<u8> {
+    // twice: the first pass finds the guest registers the region touches and writes (a
+    // register written by a later block may be behind memory at any exit or helper call of an
+    // earlier one: the dispatch loop goes round), the second emits the code with them
+    let table = jump_table(blocks);
+    let (_, used, written) = body::<B>(blocks, mem, stops, table, 0, 0, true);
+    let (c, _, _) = body::<B>(blocks, mem, stops, table, used, written, false);
+    module(&c)
+}
+
+/// The function body for a region (`compile`): the code, the registers it touched, the ones it
+/// wrote. `load` is what the entry brings into the locals and `h_op` brings again, `store`
+/// what the exit and a `h_op` call write back.
+fn body<B: Bus>(blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem, stops: bool, table: Option<(u32, u32)>, load: u16, store: u16, dry: bool) -> (Vec<u8>, u16, u16) {
     let n = blocks.len() as u32;
     let mut g = Gen {
         c: Vec::with_capacity(64 * blocks.iter().map(|b| b.2.len()).sum::<usize>()),
         mem,
         index: blocks.iter().enumerate().map(|(k, b)| (b.1, k as u32)).collect(),
-        table: jump_table(blocks),
+        table,
         pred: None,
         cur: 0,
         n,
         nest: 0,
         stops,
+        used: 0,
+        written: 0,
+        load,
+        store,
+        dry,
     };
-    // loop { block_{n-1} { .. block_0 { br_table cur } code_0 } code_1 .. } code_{n-1} }: a br
-    // to depth k from the innermost block lands on code_k; code_k reaches the loop through the
-    // n - 1 - k blocks still open
     g.get(L_START);
     g.set(L_CUR);
+    g.load_regs(load);
+    // exit { loop { block_{n-1} { .. block_0 { br_table cur } code_0 } code_1 .. } code_{n-1} } }
+    // store pc, regs; done: a br to depth k from the innermost block lands on code_k; code_k
+    // reaches the loop through the n - 1 - k blocks still open, and the exit past the loop
+    g.op(BLOCK);
+    g.op(VOID);
     g.op(LOOP);
     g.op(VOID);
     for _ in 0..n {
@@ -884,8 +962,12 @@ fn compile<B: Bus>(blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem, stops
     }
     g.op(END); // loop
     g.op(0x00); // unreachable: every block's code leaves or branches
+    g.op(END); // exit
+    g.st_field_from(off_pc(), L_PC);
+    g.store_regs(store);
+    g.get(L_DONE);
     g.op(END);
-    module(&g.c)
+    (g.c, g.used, g.written)
 }
 
 /// The code of one block of a region.
@@ -967,72 +1049,63 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
         match op.fast {
             Fast::Nop => {}
             Fast::MovI { d, v } => {
-                g.get(L_CPU);
                 g.i32c(v);
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             Fast::Mov { d, s } => {
-                g.get(L_CPU);
                 g.ld_reg(s);
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             Fast::AddRI { d, s, v } => {
-                g.get(L_CPU);
                 g.ld_reg(s);
                 g.i32c(v);
                 g.op(I32_ADD);
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             Fast::ShlI { d, s, n } | Fast::SarI { d, s, n } => {
-                g.get(L_CPU);
                 g.ld_reg(s);
                 g.i32c(n as u32 & 31);
                 g.op(if matches!(op.fast, Fast::ShlI { .. }) { I32_SHL } else { I32_SHR_S });
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             Fast::Alu3 { d, a, b, op } => {
                 g.ld_reg(a);
                 g.set(L_A);
                 g.ld_reg(b);
                 g.set(L_B);
-                g.get(L_CPU);
                 g.alu(op);
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             Fast::Alu3I { d, a, v, op } => {
                 g.ld_reg(a);
                 g.set(L_A);
                 g.i32c(v);
                 g.set(L_B);
-                g.get(L_CPU);
                 g.alu(op);
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             Fast::Alu2 { d, b, op } => {
                 g.ld_reg(d);
                 g.set(L_A);
                 g.ld_reg(b);
                 g.set(L_B);
-                g.get(L_CPU);
                 g.alu(op);
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             Fast::Alu2I { d, v, op } => {
                 g.ld_reg(d);
                 g.set(L_A);
                 g.i32c(v);
                 g.set(L_B);
-                g.get(L_CPU);
                 g.alu(op);
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             Fast::A4 { d, s, op, rk, rv } => {
                 g.rhs(rk, rv);
                 g.ld_reg(s);
                 g.set(L_A);
-                g.get(L_CPU);
                 g.alu(op);
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             Fast::MemA4 { b, off, op, rk, rv } => {
                 // [R + off] = [R + off] op rhs: one read and one write, as the interpreter
@@ -1048,7 +1121,6 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
             }
             Fast::BitExt { d, s, p, l, signed } => {
                 let (p, l) = (p as u32 & 31, l as u32 & 31);
-                g.get(L_CPU);
                 g.ld_reg(s);
                 g.i32c(p);
                 g.op(I32_SHR_U);
@@ -1063,12 +1135,11 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                     g.i32c(if l == 0 { u32::MAX } else { (1u32 << l).wrapping_sub(1) });
                     g.op(I32_AND);
                 }
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             Fast::BitIns { d, s, p, l } => {
                 let (p, l) = (p as u32 & 31, l as u32 & 31);
                 let mask = if l == 0 { u32::MAX } else { (1u32 << l).wrapping_sub(1) };
-                g.get(L_CPU);
                 g.ld_reg(d);
                 g.i32c(!(mask << p));
                 g.op(I32_AND);
@@ -1078,7 +1149,7 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.i32c(p);
                 g.op(I32_SHL);
                 g.op(I32_OR);
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             Fast::SetIe { on: false } => {
                 // `cli` (`sti` goes through the helper: it opens the bus's interrupt window)
@@ -1096,15 +1167,12 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.st_reg_from(dl, L_B);
             }
             Fast::Mov2I { dh, dl, v } => {
-                g.get(L_CPU);
                 g.i32c(v);
-                g.mem_op(I32_STORE, 2, off_reg(dl));
-                g.get(L_CPU);
+                g.st_reg(dl);
                 g.i32c(((v as i32) >> 31) as u32);
-                g.mem_op(I32_STORE, 2, off_reg(dh));
+                g.st_reg(dh);
             }
             Fast::Ext { d, s, part, signed } => {
-                g.get(L_CPU);
                 g.ld_reg(s);
                 match (part, signed) {
                     (0, false) => {
@@ -1126,14 +1194,13 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                         g.op(I32_SHR_S);
                     }
                 }
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             Fast::MinMax { d, a, b, kind } => {
                 g.ld_reg(a);
                 g.set(L_A);
                 g.ld_reg(b);
                 g.set(L_B);
-                g.get(L_CPU);
                 g.get(L_A);
                 g.get(L_B);
                 g.get(L_A);
@@ -1141,7 +1208,7 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 // select(a, b, a OP b): smin a <s b, smax a >s b, umin a <u b, umax a >u b
                 g.op(match kind { 0 => I32_LT_S, 1 => I32_GT_S, 2 => I32_LT_U, _ => I32_GT_U });
                 g.op(SELECT);
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             // ---- the FPU (fm1-isa's fpu.rs, the interpreter's `fpu`), as wasm's own f32 ops,
             // which are the IEEE single precision Rust's are in this build: + - * / as they
@@ -1155,7 +1222,6 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
             Fast::FOp { d, a, b, op } if fop_inline(op) => {
                 let k = op >> 4;
                 let to_int = op & 0xf == 0xf && k < 8;
-                g.get(L_CPU);
                 match op {
                     0..=3 => {
                         // (+ and * take b first: LLVM commuted them in the interpreter's build,
@@ -1218,7 +1284,7 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 if !to_int {
                     g.op(I32_REINTERPRET_F32);
                 }
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             Fast::SpAdd { v } => {
                 g.get(L_CPU);
@@ -1233,11 +1299,10 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.mem_op(I32_STORE, 2, off_sp());
             }
             Fast::RFromSp { d, v } => {
-                g.get(L_CPU);
                 g.ld_field(off_sp());
                 g.i32c(v);
                 g.op(I32_ADD);
-                g.mem_op(I32_STORE, 2, off_reg(d));
+                g.st_reg(d);
             }
             Fast::Ld { d, b, off, w, signed } => {
                 g.addr(b, off);
@@ -1314,7 +1379,6 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
             Fast::LdPre { d, b, i, w, signed, inc } => {
                 // b = b + inc (a register's, or the immediate), then d = [b]: the base first, as
                 // exec_fast (d may be b: the load wins)
-                g.get(L_CPU);
                 g.ld_reg(b);
                 if i < 16 {
                     g.ld_reg(i);
@@ -1323,14 +1387,13 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 }
                 g.op(I32_ADD);
                 g.tee(L_ADDR);
-                g.mem_op(I32_STORE, 2, off_reg(b));
+                g.st_reg(b);
                 g.load(w, signed, idx);
                 g.st_reg_from(d, L_VAL);
                 bus_used = true;
             }
             Fast::StPre { s, b, i, w, inc } => {
                 // b = b + inc, then [b] = s (s read after the base moved: it may be b, as exec_fast)
-                g.get(L_CPU);
                 g.ld_reg(b);
                 if i < 16 {
                     g.ld_reg(i);
@@ -1339,7 +1402,7 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 }
                 g.op(I32_ADD);
                 g.tee(L_ADDR);
-                g.mem_op(I32_STORE, 2, off_reg(b));
+                g.st_reg(b);
                 g.ld_reg(s);
                 g.set(L_VAL);
                 g.store(w, idx);
@@ -1487,11 +1550,10 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.set(L_ADDR);
                 g.load(w, signed, idx);
                 g.st_reg_from(d, L_VAL);
-                g.get(L_CPU);
                 g.ld_reg(b);
                 g.i32c(inc);
                 g.op(I32_ADD);
-                g.mem_op(I32_STORE, 2, off_reg(b));
+                g.st_reg(b);
                 bus_used = true;
             }
             Fast::StPost { s, b, w, inc } => {
@@ -1500,11 +1562,10 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.ld_reg(s);
                 g.set(L_VAL);
                 g.store(w, idx);
-                g.get(L_CPU);
                 g.ld_reg(b);
                 g.i32c(inc);
                 g.op(I32_ADD);
-                g.mem_op(I32_STORE, 2, off_reg(b));
+                g.st_reg(b);
                 bus_used = true;
             }
             Fast::Rmw { b, w, op: rop, off, v } => {
@@ -1756,14 +1817,17 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.jump_local(L_VAL, count);
                 ended = true;
             }
-            // ---- everything else: the interpreter's executor for this one op
+            // ---- everything else: the interpreter's executor for this one op, on `Cpu::regs`:
+            // the registers written so far go to memory first, and all come back after
             other => {
-                let p: &'static Fast = Box::leak(Box::new(other));
+                let p = if g.dry { std::ptr::null::<Fast>() } else { Box::leak(Box::new(other)) as *const Fast };
+                g.store_regs(g.store);
                 g.get(L_CTX);
-                g.i32c(p as *const Fast as u32);
+                g.i32c(p as u32);
                 g.idx(idx);
                 g.i32c(next_pc);
                 g.call(F_OP);
+                g.load_regs(g.load);
                 g.c.push(LOCAL_TEE);
                 uleb(&mut g.c, L_OPRES as u64);
                 g.c.push(I64_CONST);
@@ -2059,9 +2123,10 @@ fn module(body: &[u8]) -> Vec<u8> {
     name(&mut ex, "run");
     ex.extend_from_slice(&[0x00, F_RUN as u8]);
     section(&mut m, 7, &ex);
-    // code: locals a, b, addr, val, off, done, cur (i32), the op result (i64), fa, fb (f32)
+    // code: locals a, b, addr, val, off, done, cur (i32), the op result (i64), fa, fb (f32),
+    // pc and the 16 guest registers (i32)
     let mut f = Vec::new();
-    f.extend_from_slice(&[3, 7, T_I32, 1, T_I64, 2, T_F32]);
+    f.extend_from_slice(&[4, 7, T_I32, 1, T_I64, 2, T_F32, 17, T_I32]);
     f.extend_from_slice(body);
     let mut code = Vec::new();
     uleb(&mut code, 1);
