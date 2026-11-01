@@ -187,41 +187,98 @@ pub struct Ctx {
     /// by path (RAM, XIP, bus; RAM store, code-word store, bus store)
     reason: u32,
     hist: [u32; 6],
+    /// the code left at a clean edge: a goto, return, table branch or helper's jump to a block
+    /// outside the region (`run` may chain into that block's region)
+    edge: u32,
 }
 
 /// Run compiled code: returns the instructions executed; cpu.pc is set. At most `cap`
 /// instructions, as far as whole blocks go (the caller's budget, as the interpreter keeps it).
+/// Where the code leaves at a clean edge (a goto, return, table branch or helper's jump to a
+/// block outside its region) and that block is compiled in a region that is current, the next
+/// region is called from here, as `Cpu::run_fast_in`'s loop would call it, without the round
+/// through the loop (a block's lookup, the region's check, the loop's own bookkeeping): a region
+/// left every 35-60 instructions, four exits in five at such an edge. `open`: a stretch's open
+/// call (`Cpu::stop_pc`): the chain stops where the runner's checks would.
 ///
 /// # Safety
 /// `f` must come from `Jit::entry` for this bus type and memory map.
-pub(crate) unsafe fn run<B: Bus>(f: u32, start: u32, cpu: &mut Cpu, bus: &mut B, extra: u32, cap: u32) -> u32 {
-    // instructions this call may run: their ticks ((k - 1) + extra) must all fit tick_room
-    let limit = (bus.tick_room() + 1).saturating_sub(extra as u64).min(1 << 30).min(cap as u64) as u32;
-    let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, pred: [0; 3], reason: 0, hist: [0; 6] };
-    // SAFETY: on wasm32 a function pointer is its index in the function table, where the host
-    // installed this block's `run` with exactly this signature
-    let code: extern "C" fn(*mut Cpu, *mut Ctx, u32, u32) -> u32 = unsafe { std::mem::transmute(f as usize) };
-    let k = code(cpu as *mut Cpu, &mut ctx, limit, start);
-    if cpu.profile {
-        cpu.exit_hist[(ctx.reason as usize).min(cpu.exit_hist.len() - 1)] += 1;
-        cpu.exit_insns[(ctx.reason as usize).min(cpu.exit_insns.len() - 1)] += k as u64;
-        for (h, c) in cpu.mem_hist.iter_mut().zip(ctx.hist) {
-            *h += c as u64;
+pub(crate) unsafe fn run<B: Bus>(mut f: u32, mut start: u32, cpu: &mut Cpu, bus: &mut B, mut extra: u32, mut cap: u32, open: bool) -> u32 {
+    let mut total = 0u32;
+    loop {
+        // instructions this call may run: their ticks ((k - 1) + extra) must all fit tick_room
+        let limit = (bus.tick_room() + 1).saturating_sub(extra as u64).min(1 << 30).min(cap as u64) as u32;
+        let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, pred: [0; 3], reason: 0, hist: [0; 6], edge: 0 };
+        // SAFETY: on wasm32 a function pointer is its index in the function table, where the host
+        // installed this block's `run` with exactly this signature
+        let code: extern "C" fn(*mut Cpu, *mut Ctx, u32, u32) -> u32 = unsafe { std::mem::transmute(f as usize) };
+        let k = code(cpu as *mut Cpu, &mut ctx, limit, start);
+        if cpu.profile {
+            cpu.exit_hist[(ctx.reason as usize).min(cpu.exit_hist.len() - 1)] += 1;
+            cpu.exit_insns[(ctx.reason as usize).min(cpu.exit_insns.len() - 1)] += k as u64;
+            for (h, c) in cpu.mem_hist.iter_mut().zip(ctx.hist) {
+                *h += c as u64;
+            }
+        }
+        if ctx.pred[0] != 0 {
+            let (te, ee, ts) = (ctx.pred[0], ctx.pred[1], ctx.pred[2]);
+            cpu.pred_skips.retain(|&(t, _, _)| t != te);
+            cpu.pred_skips.push((te, ee, ts));
+        }
+        if k > 0 {
+            // the ticks of the instructions run, less those the helpers applied already
+            let need = (k - 1) + extra;
+            if need > ctx.synced {
+                bus.add_ticks((need - ctx.synced) as u64);
+            }
+        }
+        total += k;
+        cap = cap.saturating_sub(k);
+        if k == 0 || ctx.edge == 0 || cap == 0 {
+            return total;
+        }
+        let Some((f2, k2)) = chain_to(cpu, bus, cap, open) else { return total };
+        (f, start, extra) = (f2, k2, 1);
+        if cpu.profile {
+            cpu.jit_chains += 1;
         }
     }
-    if ctx.pred[0] != 0 {
-        let (te, ee, ts) = (ctx.pred[0], ctx.pred[1], ctx.pred[2]);
-        cpu.pred_skips.retain(|&(t, _, _)| t != te);
-        cpu.pred_skips.push((te, ee, ts));
+}
+
+/// The compiled code to go on with at cpu.pc after a clean edge, as `Cpu::run_fast_in`'s loop
+/// would find it: the block there (the block table), compiled in a region whose RAM blocks (if
+/// any) are current. `open`: a stretch's open call, which goes on only where the runner's checks
+/// at the loop's head would let it (not back at the stop pc, after a helper reached the bus, or
+/// with less than `STRETCH_ROOM` of the call's `cap` left), and not into a block that holds the
+/// stop pc inside it (the loop would cut the call there). None: back to the loop.
+#[inline]
+fn chain_to<B: Bus>(cpu: &mut Cpu, bus: &mut B, cap: u32, open: bool) -> Option<(u32, u32)> {
+    let pc = cpu.pc;
+    let id = *cpu.bmap.get(crate::icache_slot(pc))? as usize;
+    if id == 0 {
+        return None;
     }
-    if k > 0 {
-        // the ticks of the instructions run, less those the helpers applied already
-        let need = (k - 1) + extra;
-        if need > ctx.synced {
-            bus.add_ticks((need - ctx.synced) as u64);
+    let (bpc, start, len) = *cpu.blocks.get(id - 1)?;
+    if bpc != pc || len == 0 {
+        return None;
+    }
+    let j = cpu.wjit.as_ref()?;
+    let Entry::In(f, k, r) = *j.state.get(id - 1)? else { return None };
+    let (ids, ver) = &j.rinfo[r as usize];
+    if !ids.is_empty() && bus.code_writes() != Some(*ver) {
+        return None;
+    }
+    if open {
+        let stop = cpu.stop_pc;
+        if pc == stop || cpu.stop_io != 0 || cap <= crate::STRETCH_ROOM {
+            return None;
+        }
+        let bytes: u32 = cpu.bops[start as usize..(start + len) as usize].iter().map(|o| o.len as u32).sum();
+        if stop.wrapping_sub(pc) < bytes {
+            return None;
         }
     }
-    k
+    Some((f, k))
 }
 
 // ------------------------------------------------------------------ helpers called from generated code
@@ -462,6 +519,7 @@ fn off_hold() -> u32 {
 const OFF_BRK: u32 = offset_of!(Ctx, brk) as u32;
 const OFF_PRED: u32 = offset_of!(Ctx, pred) as u32;
 const OFF_REASON: u32 = offset_of!(Ctx, reason) as u32;
+const OFF_EDGE: u32 = offset_of!(Ctx, edge) as u32;
 const OFF_HIST: u32 = offset_of!(Ctx, hist) as u32;
 
 /// Exit reasons the code records when profiling (`Cpu::exit_hist`): the block does not fit the
@@ -587,6 +645,7 @@ impl Gen<'_> {
             self.end();
         }
         self.reason(reason);
+        self.edge();
         self.exit_local(l, count);
     }
     /// continue at a fixed pc, `count` instructions of this block done: the region's block there,
@@ -595,6 +654,7 @@ impl Gen<'_> {
     fn goto(&mut self, pc: u32, count: u32, last: bool) {
         let Some(&k) = self.index.get(&pc) else {
             self.reason(4);
+            self.edge();
             self.exit_imm(pc, count);
             return;
         };
@@ -647,6 +707,12 @@ impl Gen<'_> {
     fn end(&mut self) {
         self.op(END);
         self.nest -= 1;
+    }
+    /// a clean edge out of the region: ctx.edge = 1 (before the exit; `run` may chain on)
+    fn edge(&mut self) {
+        self.get(L_CTX);
+        self.i32c(1);
+        self.mem_op(I32_STORE, 2, OFF_EDGE);
     }
     /// profiling: ctx.reason = r (before an exit)
     fn reason(&mut self, r: u32) {
@@ -1965,7 +2031,7 @@ pub fn int_selftest() -> u32 {
             want.exec_fast(&mut bus, fast, 0x0200_0002);
             want.pc = 0x0200_0002;
             // SAFETY: `f` is the module just installed, built for NoBus
-            let k = unsafe { run::<NoBus>(f, 0, &mut cpu, &mut bus, 0, 1 << 20) };
+            let k = unsafe { run::<NoBus>(f, 0, &mut cpu, &mut bus, 0, 1 << 20, false) };
             if k != 1 || cpu.regs != want.regs || cpu.pc != want.pc {
                 let d = match fast { Fast::Un { d, .. } | Fast::Div { d, .. } => d as usize, _ => 0 };
                 fail(format!("{fast:?}"), x, y, format!("ran {k}, r{d} {:08x}, the executor {:08x}", cpu.regs[d], want.regs[d]));
@@ -2050,7 +2116,7 @@ pub fn fop_selftest() -> u32 {
                 want.exec_fast(&mut bus, fast, 0x0200_0004);
                 want.pc = 0x0200_0004;
                 // SAFETY: `f` is the module just installed, built for NoBus
-                let k = unsafe { run::<NoBus>(f, 0, &mut cpu, &mut bus, 0, 1 << 20) };
+                let k = unsafe { run::<NoBus>(f, 0, &mut cpu, &mut bus, 0, 1 << 20, false) };
                 let r = (d & 15) as usize;
                 if k != 1 || cpu.regs != want.regs || cpu.pc != want.pc {
                     fail(op, d, a, b, x, y, format!("ran {k}, r{r} {:08x}, the executor {:08x}", cpu.regs[r], want.regs[r]));

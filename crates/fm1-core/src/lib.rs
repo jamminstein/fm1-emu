@@ -272,6 +272,8 @@ pub struct Cpu {
     pub exit_hist: [u64; 10],
     pub exit_insns: [u64; 10],
     pub mem_hist: [u64; 6],
+    /// regions the wasm JIT's `run` chained into at a clean edge (`jit_wasm::run`)
+    pub jit_chains: u64,
     /// Instruction-cache misses (decodes) since reset.
     pub decodes: u64,
     /// Canonical syntax of the instruction executing (from its cache line).
@@ -455,7 +457,7 @@ impl Cpu {
         };
         #[cfg(not(target_arch = "wasm32"))]
         let exits = String::new();
-        format!("{{\"entries\":{},\"instructions\":{},\"insns\":{},\"helpers\":{{{helpers}}}{exits}}}", self.jit_entries, self.jit_insns, self.insn_count)
+        format!("{{\"entries\":{},\"chains\":{},\"instructions\":{},\"insns\":{},\"helpers\":{{{helpers}}}{exits}}}", self.jit_entries, self.jit_chains, self.jit_insns, self.insn_count)
     }
 
     /// Count a JIT helper call when profiling. Called for every helper op, so the check is
@@ -857,7 +859,7 @@ impl Cpu {
                         let open = stretch && whole && self.wjit.as_ref().is_some_and(|j| j.stops);
                         let cap = if open { budget - n } else { limit - n };
                         // SAFETY: code was compiled for this bus type and memory map
-                        let k = unsafe { jit_wasm::run(code, at, self, bus, extra, cap) };
+                        let k = unsafe { jit_wasm::run(code, at, self, bus, extra, cap, open) };
                         if self.profile { self.jit_entries += 1; self.jit_insns += k as u64; }
                         if k > 0 {
                             n += k;
@@ -885,7 +887,7 @@ impl Cpu {
                                 }
                                 sync!();
                                 // SAFETY: as above; n > 0: the first instruction's tick is due
-                                let k = unsafe { jit_wasm::run(f, at, self, bus, 1, limit - n) };
+                                let k = unsafe { jit_wasm::run(f, at, self, bus, 1, limit - n, false) };
                                 if self.profile { self.jit_entries += 1; self.jit_insns += k as u64; }
                                 if k == 0 {
                                     break;
